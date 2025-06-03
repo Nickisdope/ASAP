@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from humanoidverse.agents.modules.ppo_modules import PPOActor, PPOCritic
 from humanoidverse.agents.modules.data_utils import RolloutStorage
@@ -115,8 +116,10 @@ class PPO(BaseAlgo):
                                            lr=self.critic_learning_rate)
 
     def _setup_storage(self):
+        # NOTE: put RolloutStorage in GPU for speed
         self.storage = RolloutStorage(self.env.num_envs,
-                                      self.num_steps_per_env)
+                                      self.num_steps_per_env,
+                                      device=self.device)
         ## Register obs keys
         for obs_key, obs_dim in self.algo_obs_dim_dict.items():
             self.storage.register_key(obs_key,
@@ -208,13 +211,31 @@ class PPO(BaseAlgo):
 
         # do not use track, because it will confict with motion loading bar
         # for it in track(range(self.current_learning_iteration, tot_iter), description="Learning Iterations"):
+        # with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
+        #              record_shapes=True) as prof:
         for it in range(self.current_learning_iteration, tot_iter):
             self.start_time = time.time()
 
             # Jiawei: Need to return obs_dict to update the obs_dict for the next iteration
             # Otherwise, we will keep using the initial obs_dict for the whole training process
-            obs_dict = self._rollout_step(obs_dict)
 
+            # with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
+            #         record_shapes=True, with_modules=True, with_stack=True) as prof:
+            # with record_function("rollout"):
+            obs_dict = self._rollout_step(obs_dict)
+            # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+            # return
+            # sorted_events = sorted(prof.key_averages(), key=lambda evt: evt.cpu_time_total, reverse=True)
+            # for evt in sorted_events[:10]:
+            #     print(f"Op: {evt.key}, CPU total: {evt.cpu_time_total / 1000:.3f}ms")
+            #     for line in evt.stack:
+            #         print(line)
+            #     for line in evt.cpu_children:
+            #         print(line)
+            #     print("-" * 50)
+            # prof.export_chrome_trace("trace.json")
+
+            # with record_function("train"):
             loss_dict = self._training_step()
 
             self.stop_time = time.time()
@@ -235,6 +256,9 @@ class PPO(BaseAlgo):
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             self.ep_infos.clear()
+
+        # print(prof.key_averages().table(sort_by="cpu_time_total",
+        #                                 row_limit=10))
 
         self.current_learning_iteration += num_learning_iterations
         self.save(
@@ -272,7 +296,7 @@ class PPO(BaseAlgo):
                 values = self._critic_eval_step(obs_dict).detach()
                 policy_state_dict["values"] = values
 
-                ## Append states to storage
+                ## Append states to storage (NOTE: this is efficent if both on GPU)
                 for obs_key in obs_dict.keys():
                     self.storage.update_key(obs_key, obs_dict[obs_key])
 
@@ -283,16 +307,17 @@ class PPO(BaseAlgo):
                 actor_state["actions"] = actions
                 obs_dict, rewards, dones, infos = self.env.step(actor_state)
                 # critic_obs = privileged_obs if privileged_obs is not None else obs
-                for obs_key in obs_dict.keys():
-                    obs_dict[obs_key] = obs_dict[obs_key].to(self.device)
-                rewards, dones = rewards.to(self.device), dones.to(self.device)
+                # NOTE: values are already in gpu, this shouldn't be necessary
+                # for obs_key in obs_dict.keys():
+                #     obs_dict[obs_key] = obs_dict[obs_key].to(self.device)
+                # rewards, dones = rewards.to(self.device), dones.to(self.device)
 
                 self.episode_env_tensors.add(infos["to_log"])
                 rewards_stored = rewards.clone().unsqueeze(1)
                 if 'time_outs' in infos:
                     rewards_stored += self.gamma * policy_state_dict[
-                        'values'] * infos['time_outs'].unsqueeze(1).to(
-                            self.device)
+                        'values'] * infos['time_outs'].unsqueeze(1)
+
                 assert len(rewards_stored.shape) == 2
                 self.storage.update_key('rewards', rewards_stored)
                 self.storage.update_key('dones', dones.unsqueeze(1))
@@ -300,6 +325,7 @@ class PPO(BaseAlgo):
 
                 self._process_env_step(rewards, dones, infos)
 
+                # NOTE: this chunk doesn't impact runtime much 
                 if self.log_dir is not None:
                     # Book keeping
                     if 'episode' in infos:
@@ -361,10 +387,11 @@ class PPO(BaseAlgo):
         dones = policy_state_dict['dones']
         rewards = policy_state_dict['rewards']
 
-        last_values = last_values.to(self.device)
-        values = values.to(self.device)
-        dones = dones.to(self.device)
-        rewards = rewards.to(self.device)
+        # NOTE: unecessary already on GPU
+        # last_values = last_values.to(self.device)
+        # values = values.to(self.device)
+        # dones = dones.to(self.device)
+        # rewards = rewards.to(self.device)
 
         returns = torch.zeros_like(values)
 
@@ -396,9 +423,9 @@ class PPO(BaseAlgo):
 
         for policy_state_dict in generator:
             # Move everything to the device
-            for policy_state_key in policy_state_dict.keys():
-                policy_state_dict[policy_state_key] = policy_state_dict[
-                    policy_state_key].to(self.device)
+            # for policy_state_key in policy_state_dict.keys():
+            #     policy_state_dict[policy_state_key] = policy_state_dict[
+            #         policy_state_key].to(self.device)
             loss_dict = self._update_algo_step(policy_state_dict, loss_dict)
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
