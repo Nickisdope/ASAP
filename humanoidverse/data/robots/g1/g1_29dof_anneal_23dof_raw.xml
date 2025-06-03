@@ -1,6 +1,7 @@
 <mujoco model="g1_29dof_anneal_23dof">
   <compiler angle="radian" meshdir="meshes"/>
   
+  <!-- from unitree_rl_gym -->
   <default>
     <joint limited="true" damping="0.001" armature="0.01" frictionloss="0.1"/>
   </default>
